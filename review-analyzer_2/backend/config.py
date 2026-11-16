@@ -39,5 +39,8 @@ GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-3.6-flash").strip()
 AMAZON_DOMAIN = (os.getenv("AMAZON_DOMAIN") or "amazon.in").strip()
 CACHE_TTL_SECONDS = int(_get_float("CACHE_TTL_HOURS", 24) * 3600)
 
-_db_path = Path(os.getenv("DB_PATH") or "data/cache.sqlite3")
+# Vercel's deployment filesystem is read-only. /tmp is writable but ephemeral,
+# so this cache is best-effort and may reset between function instances.
+_default_db_path = "/tmp/worthit-cache.sqlite3" if os.getenv("VERCEL") else "data/cache.sqlite3"
+_db_path = Path(os.getenv("DB_PATH") or _default_db_path)
 DB_PATH = _db_path if _db_path.is_absolute() else ROOT_DIR / _db_path
