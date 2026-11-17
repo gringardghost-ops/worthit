@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from ..config import GEMINI_MODEL, ConfigError, get_key
+from ..config import GEMINI_FALLBACK_MODELS, GEMINI_MODEL, ConfigError, get_key
 from .cleaner import CleanedData
 from .scraper import Entity
 
@@ -133,7 +133,19 @@ def _strip_fences(text: str) -> str:
     return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I)
 
 
+def _model_chain() -> list[str]:
+    chain = [GEMINI_MODEL]
+    for m in GEMINI_FALLBACK_MODELS:
+        if m not in chain:
+            chain.append(m)
+    return chain
+
+
+_RETRYABLE_CODES = (429, 500, 502, 503, 504)
+
+
 async def _call_gemini(prompt: str) -> LLMVerdict:
+    """Call Gemini, retrying briefly and then falling back to other models when one is overloaded."""
     key = get_key("GEMINI_API_KEY")
     if not key:
         raise ConfigError("GEMINI_API_KEY is missing. Add it to your .env file and restart the server.")
@@ -150,38 +162,53 @@ async def _call_gemini(prompt: str) -> LLMVerdict:
     )
 
     last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            resp = await client.aio.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
-            parsed = getattr(resp, "parsed", None)
-            if isinstance(parsed, LLMVerdict):
-                return parsed
-            text = getattr(resp, "text", None)
-            if not text:
-                raise AnalyzerError("Gemini returned an empty response (it may have been blocked by a safety filter).", 502)
-            return LLMVerdict.model_validate(json.loads(_strip_fences(text)))
-        except errors.APIError as exc:
-            code = getattr(exc, "code", None)
-            last_error = exc
-            if code in (401, 403) or (code == 400 and "API key" in str(exc)):
-                raise AnalyzerError("Gemini rejected the API key. Check GEMINI_API_KEY in your .env file.", 401) from exc
-            if code in (429, 500, 502, 503, 504) and attempt < 2:
-                await asyncio.sleep(2.0 * (attempt + 1))
+    last_code: int | None = None
+    for model in _model_chain():
+        for attempt in range(2):
+            try:
+                resp = await client.aio.models.generate_content(model=model, contents=prompt, config=config)
+                parsed = getattr(resp, "parsed", None)
+                if isinstance(parsed, LLMVerdict):
+                    verdict = parsed
+                else:
+                    text = getattr(resp, "text", None)
+                    if not text:
+                        raise AnalyzerError("Gemini returned an empty response (it may have been blocked by a safety filter).", 502)
+                    verdict = LLMVerdict.model_validate(json.loads(_strip_fences(text)))
+                if model != GEMINI_MODEL:
+                    log.warning("Answered by fallback model %s (primary %s was unavailable)", model, GEMINI_MODEL)
+                return verdict
+            except errors.APIError as exc:
+                code = getattr(exc, "code", None)
+                last_error, last_code = exc, code
+                if code in (401, 403) or (code == 400 and "API key" in str(exc)):
+                    raise AnalyzerError("Gemini rejected the API key. Check GEMINI_API_KEY in your .env file.", 401) from exc
+                if code == 404:  # model retired or not available to this key: go straight to the next one
+                    log.warning("Gemini model %s not found; trying the next model", model)
+                    break
+                if code in _RETRYABLE_CODES:
+                    if attempt == 0:
+                        await asyncio.sleep(1.5)
+                        continue
+                    log.warning("Gemini model %s still failing (%s); trying the next model", model, code)
+                    break
+                raise AnalyzerError(f"Gemini API error ({code}): {getattr(exc, 'message', None) or exc}", 502) from exc
+            except AnalyzerError:
+                raise
+            except (ValidationError, ValueError) as exc:  # malformed JSON from the model: retry, then next model
+                last_error = exc
                 continue
-            if code == 429:
-                raise AnalyzerError("Gemini rate limit or quota reached. Try again shortly.", 429) from exc
-            raise AnalyzerError(f"Gemini API error ({code}): {getattr(exc, 'message', None) or exc}", 502) from exc
-        except (ValidationError, ValueError) as exc:  # malformed JSON from the model: retry once or twice
-            last_error = exc
-            if attempt < 2:
-                continue
-        except AnalyzerError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - network or SDK failures
-            last_error = exc
-            if attempt < 2:
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
+            except Exception as exc:  # noqa: BLE001 - network or SDK failures
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+
+    if last_code == 429:
+        raise AnalyzerError("Gemini rate limit or quota reached. Try again shortly.", 429)
+    if last_code in _RETRYABLE_CODES:
+        raise AnalyzerError("Gemini is overloaded right now. Please try again in a minute.", 502)
     raise AnalyzerError(f"Gemini analysis failed: {last_error or 'unknown error'}", 502)
 
 

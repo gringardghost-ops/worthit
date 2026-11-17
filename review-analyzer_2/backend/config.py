@@ -36,6 +36,10 @@ def _get_float(name: str, default: float) -> float:
 
 
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-3.6-flash").strip()
+# Tried in order when the main model is overloaded (503) or unavailable (404).
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in (os.getenv("GEMINI_FALLBACK_MODELS") or "gemini-3.8-flash,gemini-3.7-flash").split(",") if m.strip()
+]
 AMAZON_DOMAIN = (os.getenv("AMAZON_DOMAIN") or "amazon.in").strip()
 CACHE_TTL_SECONDS = int(_get_float("CACHE_TTL_HOURS", 24) * 3600)
 
