@@ -35,7 +35,7 @@ uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 | --- | --- | --- |
 | `SERPAPI_KEY` | required | Entity resolution and review data |
 | `GEMINI_API_KEY` | required | LLM synthesis |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model used for analysis |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Fast model used for analysis |
 | `CACHE_TTL_HOURS` | `24` | How long a result is served from SQLite |
 | `AMAZON_DOMAIN` | `amazon.in` | Amazon marketplace for product lookups |
 | `DB_PATH` | `data/cache.sqlite3` | SQLite cache location |
@@ -63,6 +63,7 @@ Interactive docs are at http://localhost:8000/docs.
 - Reddit: if the exact query finds no threads, a shorter version with spec noise removed is tried.
 - One of the two Google review batches fails: the other is still analyzed.
 - Zero usable reviews overall: a clear 422 error. Rate limits return 429, bad keys 401/503.
+- If Gemini is slow or temporarily unavailable, the app returns a clearly labeled, low-confidence rating-only result; it does not claim to assess review themes or authenticity in that fallback.
 - Identical concurrent searches share one pipeline run, so you are not charged twice.
 
 ## Project layout

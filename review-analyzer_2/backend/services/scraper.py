@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -19,6 +20,8 @@ REDDIT_USER_AGENT = "Mozilla/5.0 (compatible; ReviewAnalyzerBot/1.0)"
 
 PLACE_RELEVANT_TARGET = 20
 PLACE_LOWEST_TARGET = 15
+MAX_PLACE_REVIEW_PAGES = 2
+REDDIT_TIMEOUT_SECONDS = 35
 MAX_REDDIT_THREADS = 3
 MAX_COMMENTS_PER_THREAD = 12
 
@@ -111,20 +114,28 @@ def _is_fatal(exc: BaseException) -> bool:
     return isinstance(exc, ConfigError) or (isinstance(exc, SerpApiError) and exc.status_code == 401)
 
 
-async def _serp(client: httpx.AsyncClient, params: dict[str, Any], retries: int = 2) -> dict[str, Any]:
+async def _serp(client: httpx.AsyncClient, params: dict[str, Any], retries: int = 1) -> dict[str, Any]:
     """One SerpApi call with retry on 429/5xx/network errors. Empty results -> {}."""
     key = get_key("SERPAPI_KEY")
     if not key:
         raise ConfigError("SERPAPI_KEY is missing. Add it to your .env file and restart the server.")
     query = {**params, "api_key": key}
 
+    started = time.perf_counter()
+    engine = str(params.get("engine", "unknown"))
     for attempt in range(retries + 1):
         try:
             resp = await client.get(SERPAPI_URL, params=query)
+        except httpx.TimeoutException as exc:
+            # Retrying an already-slow search makes the user wait twice as long.
+            log.warning("SerpApi %s timed out after %.1fs", engine, time.perf_counter() - started)
+            raise SerpApiError("SerpApi took too long to respond.", 504) from exc
         except httpx.HTTPError as exc:
             if attempt < retries:
-                await asyncio.sleep(1.2 * (attempt + 1))
+                log.warning("SerpApi %s attempt %d failed (%s); retrying once", engine, attempt + 1, exc.__class__.__name__)
+                await asyncio.sleep(0.5)
                 continue
+            log.warning("SerpApi %s failed after %.1fs (%s)", engine, time.perf_counter() - started, exc.__class__.__name__)
             raise SerpApiError(f"Could not reach SerpApi ({exc.__class__.__name__}).", 504) from exc
 
         try:
@@ -139,11 +150,13 @@ async def _serp(client: httpx.AsyncClient, params: dict[str, Any], retries: int 
                 if "hasn't returned any results" in low or "no results" in low:
                     return {}
                 raise SerpApiError(f"SerpApi: {err}", 502)
+            log.info("SerpApi %s completed in %.1fs", engine, time.perf_counter() - started)
             return data
 
         detail = (data.get("error") if isinstance(data, dict) else None) or resp.text[:200] or f"HTTP {resp.status_code}"
         if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-            await asyncio.sleep(1.5 * (attempt + 1))
+            log.warning("SerpApi %s returned %d; retrying once", engine, resp.status_code)
+            await asyncio.sleep(0.5)
             continue
         if resp.status_code in (401, 403):
             raise SerpApiError("SerpApi rejected the API key. Check SERPAPI_KEY in your .env file.", 401)
@@ -214,7 +227,7 @@ def _parse_place_review(r: dict[str, Any], batch: str) -> Optional[RawReview]:
 async def _place_reviews(client: httpx.AsyncClient, data_id: str, sort_by: str, target: int, batch: str) -> list[RawReview]:
     out: list[RawReview] = []
     token: Optional[str] = None
-    for _ in range(3):  # at most 3 pages per batch
+    for _ in range(MAX_PLACE_REVIEW_PAGES):  # bound pagination latency per batch
         params: dict[str, Any] = {"engine": "google_maps_reviews", "data_id": data_id, "sort_by": sort_by, "hl": "en"}
         if token:
             params["next_page_token"] = token
@@ -531,7 +544,7 @@ async def _fetch_reddit(
 async def ingest(query: str, entity_type: str) -> IngestionResult:
     """Resolve the entity and gather reviews + Reddit sentiment concurrently."""
     warnings: list[str] = []
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as serp_client, httpx.AsyncClient(
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=4.0)) as serp_client, httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=8.0), follow_redirects=True
     ) as reddit_client:
         # Reddit does not depend on entity resolution, so it runs alongside it.
@@ -545,6 +558,11 @@ async def ingest(query: str, entity_type: str) -> IngestionResult:
             reddit_task.cancel()
             await asyncio.gather(reddit_task, return_exceptions=True)
             raise
-        reddit_reviews = await reddit_task
+        try:
+            reddit_reviews = await asyncio.wait_for(reddit_task, timeout=REDDIT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            warnings.append("Reddit took too long to respond; the verdict uses the review-site data available.")
+            await asyncio.gather(reddit_task, return_exceptions=True)
+            reddit_reviews = []
 
     return IngestionResult(entity=entity, reviews=_dedupe_pairs(reviews), reddit=_dedupe_pairs(reddit_reviews), warnings=warnings)

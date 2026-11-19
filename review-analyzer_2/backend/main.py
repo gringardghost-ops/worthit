@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -17,6 +18,9 @@ from .services import analyzer, cleaner, scraper
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("worthit")
+
+# Keep a little headroom below Vercel's configured 300-second function limit.
+PIPELINE_TIMEOUT_SECONDS = 105
 
 
 @asynccontextmanager
@@ -46,14 +50,24 @@ class AnalyzeRequest(BaseModel):
 
 
 async def _run_pipeline(query: str, entity_type: str) -> analyzer.AnalysisResult:
+    started = time.perf_counter()
     ingestion = await scraper.ingest(query, entity_type)
+    log.info(
+        "Review ingestion completed in %.1fs (type=%s, reviews=%d, reddit=%d)",
+        time.perf_counter() - started,
+        entity_type,
+        len(ingestion.reviews),
+        len(ingestion.reddit),
+    )
     cleaned = cleaner.clean(ingestion.reviews, ingestion.reddit)
     if cleaned.total == 0:
         raise scraper.InsufficientDataError(
             f'Found "{ingestion.entity.name}" but no usable reviews. '
             + (" ".join(ingestion.warnings) or "Try a more specific or more popular search.")
         )
-    return await analyzer.analyze(ingestion.entity, entity_type, cleaned, ingestion.warnings)
+    result = await analyzer.analyze(ingestion.entity, entity_type, cleaned, ingestion.warnings)
+    log.info("Gemini analysis completed in %.1fs (type=%s)", time.perf_counter() - started, entity_type)
+    return result
 
 
 @app.post("/api/analyze", response_model=analyzer.AnalysisResult)
@@ -77,7 +91,14 @@ async def analyze_endpoint(req: AnalyzeRequest) -> analyzer.AnalysisResult:
                 hit["cached"] = True
                 return analyzer.AnalysisResult.model_validate(hit)
         try:
-            result = await _run_pipeline(req.query, req.type)
+            async with asyncio.timeout(PIPELINE_TIMEOUT_SECONDS):
+                result = await _run_pipeline(req.query, req.type)
+        except TimeoutError as exc:
+            log.warning("Analysis exceeded %ss safety limit (type=%s)", PIPELINE_TIMEOUT_SECONDS, req.type)
+            raise HTTPException(
+                504,
+                "The review sources took too long to respond. Try again, or use a more specific product or place name.",
+            ) from exc
         except (scraper.ScraperError, analyzer.AnalyzerError, ConfigError) as exc:
             raise HTTPException(exc.status_code, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001

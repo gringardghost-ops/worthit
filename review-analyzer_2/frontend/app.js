@@ -158,7 +158,7 @@
     if (typeof d === 'string') return d;
     return `The server returned an error (${status}).`;
   }
-  const ERROR_TITLES = { 404: "We couldn't find that", 422: 'Not enough reviews to judge', 429: 'Rate limit reached', 503: 'Setup needed', 504: 'A data source timed out' };
+  const ERROR_TITLES = { 404: "We couldn't find that", 422: 'Not enough reviews to judge', 429: 'Rate limit reached', 503: 'Setup needed', 504: 'A review source is slow' };
 
   async function analyze({ force = false } = {}) {
     const query = els.input.value.trim().replace(/\s+/g, ' ');
@@ -167,7 +167,8 @@
     state.busy = true;
     state.lastRequest = { query, type: state.type };
     state.controller = new AbortController();
-    const timeout = setTimeout(() => state.controller.abort(), 180000);
+    // The API returns its own 504 after 105s; this is a final safety net if the connection stalls.
+    const timeout = setTimeout(() => state.controller.abort(), 120000);
     startLoading();
     try {
       const res = await fetch('/api/analyze', {
@@ -184,7 +185,7 @@
       loadRecent();
     } catch (e) {
       showError(e.name === 'AbortError' ? 'This is taking too long' : "Can't reach the server",
-        e.name === 'AbortError' ? 'The request timed out after 3 minutes. Try again in a moment.' : 'Make sure the launcher is still running, then try again.');
+        e.name === 'AbortError' ? 'The server did not finish in time. A review source may be slow; try again with a more specific name.' : 'Make sure the launcher is still running, then try again.');
     } finally {
       clearTimeout(timeout);
       clearInterval(timerId);
@@ -222,6 +223,7 @@
 
   function renderResult(r) {
     const score = Number(r.worth_it_score) || 1;
+    const aiFallback = (r.data_notes || []).some((note) => note.startsWith('AI analysis unavailable:'));
     const tier = tierOf(score);
     els.results.dataset.tier = tier;
 
@@ -243,15 +245,17 @@
     notes.replaceChildren(...(r.data_notes || []).map((n) => el('li', { text: n })));
     notes.hidden = !(r.data_notes || []).length;
 
-    fillList($('#pros-list'), r.pros || [], 'No clear strengths surfaced.');
-    fillList($('#cons-list'), r.cons || [], 'No recurring complaints surfaced.');
+    fillList($('#pros-list'), r.pros || [], aiFallback ? 'Not assessed in this rating-only result.' : 'No clear strengths surfaced.');
+    fillList($('#cons-list'), r.cons || [], aiFallback ? 'Not assessed in this rating-only result.' : 'No recurring complaints surfaced.');
 
     const flags = r.red_flags || [];
     const auth = $('#auth-card');
-    auth.dataset.clean = String(!flags.length);
-    $('.auth-ico', auth).innerHTML = flags.length ? AUTH_ICONS.flag : AUTH_ICONS.clean;
-    $('#auth-title').textContent = flags.length ? `Authenticity red flags (${flags.length})` : 'Clean authenticity signal';
-    $('#auth-clean').textContent = 'No fake-review patterns, rating spikes or recent quality decline were detected in the sampled reviews.';
+    auth.dataset.clean = aiFallback ? 'unknown' : String(!flags.length);
+    $('.auth-ico', auth).innerHTML = aiFallback ? '' : flags.length ? AUTH_ICONS.flag : AUTH_ICONS.clean;
+    $('#auth-title').textContent = aiFallback ? 'Authenticity not assessed' : flags.length ? `Authenticity red flags (${flags.length})` : 'Clean authenticity signal';
+    $('#auth-clean').textContent = aiFallback
+      ? 'The AI service was unavailable, so this result could not assess fake-review patterns.'
+      : 'No fake-review patterns, rating spikes or recent quality decline were detected in the sampled reviews.';
     fillList($('#flags-list'), flags, '');
 
     // reset filter, reveal, then animate the gauge
@@ -296,7 +300,8 @@
     ];
     if (r.pros.length) lines.push('', 'Pros:', ...r.pros.map((p) => `- ${p}`));
     if (r.cons.length) lines.push('', 'Cons:', ...r.cons.map((c) => `- ${c}`));
-    lines.push('', r.red_flags.length ? ['Red flags:', ...r.red_flags.map((f) => `- ${f}`)].join('\n') : 'Red flags: none detected');
+    const aiFallback = (r.data_notes || []).some((note) => note.startsWith('AI analysis unavailable:'));
+    lines.push('', aiFallback ? 'Authenticity: not assessed (AI unavailable)' : r.red_flags.length ? ['Red flags:', ...r.red_flags.map((f) => `- ${f}`)].join('\n') : 'Red flags: none detected');
     const text = lines.join('\n');
     try {
       await navigator.clipboard.writeText(text);

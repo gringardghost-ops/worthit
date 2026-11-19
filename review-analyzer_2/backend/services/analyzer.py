@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -142,6 +143,8 @@ def _model_chain() -> list[str]:
 
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
+GEMINI_TOTAL_TIMEOUT_SECONDS = 35
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = 18
 
 
 async def _call_gemini(prompt: str) -> LLMVerdict:
@@ -158,15 +161,26 @@ async def _call_gemini(prompt: str) -> LLMVerdict:
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=LLMVerdict,
+        max_output_tokens=800,
+        thinking_config=types.ThinkingConfig(thinking_level="minimal"),
         temperature=0.3,
     )
 
+    started = time.perf_counter()
     last_error: Exception | None = None
     last_code: int | None = None
+    timed_out = False
     for model in _model_chain():
         for attempt in range(2):
+            remaining = GEMINI_TOTAL_TIMEOUT_SECONDS - (time.perf_counter() - started)
+            if remaining <= 0:
+                timed_out = True
+                break
             try:
-                resp = await client.aio.models.generate_content(model=model, contents=prompt, config=config)
+                resp = await asyncio.wait_for(
+                    client.aio.models.generate_content(model=model, contents=prompt, config=config),
+                    timeout=min(GEMINI_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
                 parsed = getattr(resp, "parsed", None)
                 if isinstance(parsed, LLMVerdict):
                     verdict = parsed
@@ -177,7 +191,12 @@ async def _call_gemini(prompt: str) -> LLMVerdict:
                     verdict = LLMVerdict.model_validate(json.loads(_strip_fences(text)))
                 if model != GEMINI_MODEL:
                     log.warning("Answered by fallback model %s (primary %s was unavailable)", model, GEMINI_MODEL)
+                log.info("Gemini model %s completed in %.1fs", model, time.perf_counter() - started)
                 return verdict
+            except asyncio.TimeoutError as exc:
+                last_error, last_code, timed_out = exc, 504, True
+                log.warning("Gemini model %s timed out after %.1fs; trying fallback if budget remains", model, time.perf_counter() - started)
+                break
             except errors.APIError as exc:
                 code = getattr(exc, "code", None)
                 last_error, last_code = exc, code
@@ -204,7 +223,12 @@ async def _call_gemini(prompt: str) -> LLMVerdict:
                     await asyncio.sleep(1.0)
                     continue
                 break
+        if time.perf_counter() - started >= GEMINI_TOTAL_TIMEOUT_SECONDS:
+            timed_out = True
+            break
 
+    if timed_out:
+        raise AnalyzerError("Gemini took too long to respond. Please try again shortly.", 504)
     if last_code == 429:
         raise AnalyzerError("Gemini rate limit or quota reached. Try again shortly.", 429)
     if last_code in _RETRYABLE_CODES:
@@ -222,11 +246,48 @@ def _tidy(items: list[str], limit: int = 5) -> list[str]:
     return out[:limit]
 
 
+def _rating_only_verdict(cleaned: CleanedData) -> LLMVerdict:
+    """Return an explicit low-confidence rating signal when Gemini is unavailable."""
+    average = cleaned.stats.get("sample_average_rating")
+    score = round(float(average) * 2, 1) if average is not None else 5.0
+    if average is None:
+        rationale = (
+            "The AI review analysis is temporarily unavailable, and the sampled reviews did not include enough ratings "
+            "to calculate a rating-only score. Treat this as an incomplete result."
+        )
+    else:
+        rationale = (
+            "The AI review analysis is temporarily unavailable. This quick score only converts the average rating "
+            f"from the sampled reviews ({float(average):.1f}/5); it does not summarize review themes or assess authenticity."
+        )
+    return LLMVerdict(
+        worth_it_score=score,
+        trust_confidence="Low",
+        verdict_headline="Quick rating signal only; full review analysis is unavailable.",
+        rationale=rationale,
+        pros=[],
+        cons=[],
+        red_flags=[],
+    )
+
+
 async def analyze(entity: Entity, entity_type: str, cleaned: CleanedData, notes: list[str]) -> AnalysisResult:
-    verdict = await _call_gemini(build_prompt(entity, entity_type, cleaned, notes))
+    result_notes = list(notes)
+    used_fallback = False
+    try:
+        verdict = await _call_gemini(build_prompt(entity, entity_type, cleaned, notes))
+    except AnalyzerError as exc:
+        if exc.status_code not in (429, 502, 504):
+            raise
+        log.warning("Using rating-only fallback because Gemini did not complete (%s)", exc.status_code)
+        verdict = _rating_only_verdict(cleaned)
+        result_notes.append(
+            "AI analysis unavailable: this result uses sampled average ratings only. Pros, cons, and authenticity were not assessed."
+        )
+        used_fallback = True
 
     total = cleaned.total
-    trust = _normalize_trust_level(verdict.trust_confidence)
+    trust = "Low" if used_fallback else _normalize_trust_level(verdict.trust_confidence)
     # Deterministic guardrails so thin evidence can never claim high confidence.
     if total < 5:
         trust = "Low"
@@ -251,5 +312,5 @@ async def analyze(entity: Entity, entity_type: str, cleaned: CleanedData, notes:
         sources_analyzed_count=total,
         source_breakdown=breakdown,
         cached=False,
-        data_notes=notes,
+        data_notes=result_notes,
     )
